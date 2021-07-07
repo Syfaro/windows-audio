@@ -1,9 +1,17 @@
+//! A wrapper to control Windows audio device and per-application volume and
+//! mute status.
+
+#![warn(missing_docs)]
+
+use crossbeam_channel::{unbounded, Receiver};
 use windows::{Abi, Guid, Interface};
 
 use bindings::Windows::Win32::Foundation::{CloseHandle, HINSTANCE, PSTR, PWSTR};
 use bindings::Windows::Win32::Media::Audio::CoreAudio::{
-    eAll, eMultimedia, eRender, IAudioEndpointVolume, IAudioSessionControl2, IAudioSessionManager2,
-    IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eAll, eMultimedia, eRender, IAudioEndpointVolume, IAudioEndpointVolumeCallback,
+    IAudioSessionControl2, IAudioSessionEvents, IAudioSessionManager2, IAudioSessionNotification,
+    IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, ISimpleAudioVolume, MMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
 };
 use bindings::Windows::Win32::Storage::StructuredStorage::{
     PropVariantClear, PROPVARIANT, STGM_READ,
@@ -14,6 +22,8 @@ use bindings::Windows::Win32::System::{
     ProcessStatus::{K32GetModuleBaseNameW, K32GetModuleFileNameExA},
     Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
 };
+
+pub mod events;
 
 lazy_static::lazy_static! {
     static ref DEVICE_GUID: Guid = Guid::from("a45c254e-df1c-4efd-8020-67d146a850e0");
@@ -108,6 +118,23 @@ impl AudioDevice {
         }
     }
 
+    /// Get notifications for changes in connected devices.
+    pub fn notifications(
+    ) -> windows::Result<(IMMNotificationClient, Receiver<events::DeviceNotification>)> {
+        let (tx, rx) = unbounded();
+
+        let device_notifications = events::DeviceNotifications::new(tx);
+
+        unsafe {
+            let device_enumerator: IMMDeviceEnumerator =
+                windows::create_instance(&MMDeviceEnumerator)?;
+
+            device_enumerator.RegisterEndpointNotificationCallback(device_notifications.clone())?;
+        }
+
+        Ok((device_notifications, rx))
+    }
+
     /// Activate the device volume control interface on demand, and keep a
     /// reference for future use.
     fn audio_endpoint_volume(&mut self) -> windows::Result<&IAudioEndpointVolume> {
@@ -129,6 +156,23 @@ impl AudioDevice {
         self.audio_endpoint_volume = audio_endpoint_volume;
 
         Ok(self.audio_endpoint_volume.as_ref().unwrap())
+    }
+
+    /// Register for events on device changes.
+    pub fn events(
+        &mut self,
+    ) -> windows::Result<(IAudioEndpointVolumeCallback, Receiver<events::DeviceEvent>)> {
+        let (tx, rx) = unbounded();
+
+        let audio_endpoint_volume = self.audio_endpoint_volume()?;
+
+        let session_events = events::DeviceEvents::new(tx);
+
+        unsafe {
+            audio_endpoint_volume.RegisterControlChangeNotify(session_events.clone())?;
+        }
+
+        Ok((session_events, rx))
     }
 }
 
@@ -216,6 +260,32 @@ impl AudioSessionManager {
 
         Ok(audio_sessions)
     }
+
+    /// Get events for new sessions.
+    pub fn events(
+        &self,
+    ) -> windows::Result<(
+        IAudioSessionNotification,
+        Receiver<events::AudioSessionNotification>,
+    )> {
+        let (tx, rx) = unbounded();
+
+        let session_events = events::AudioSessionNotifications::new(tx);
+
+        tracing::debug!("registering session notifications");
+
+        unsafe {
+            self.manager
+                .RegisterSessionNotification(session_events.clone())?;
+
+            // Windows API requires calling GetCount before notifications will
+            // be sent.
+            let session_enumerator = self.manager.GetSessionEnumerator()?;
+            let _session_count = session_enumerator.GetCount()?;
+        }
+
+        Ok((session_events, rx))
+    }
 }
 
 /// A specific audio session.
@@ -288,6 +358,22 @@ impl AudioSession {
             Ok(Some(AudioSessionProcess { pid, path, name }))
         }
     }
+
+    /// Register for events on session changes.
+    pub fn events(
+        &self,
+    ) -> windows::Result<(IAudioSessionEvents, Receiver<events::AudioSessionEvent>)> {
+        let (tx, rx) = unbounded();
+
+        let session_events = events::AudioSessionEvents::new(tx);
+
+        unsafe {
+            self.session
+                .RegisterAudioSessionNotification(session_events.clone())?;
+        }
+
+        Ok((session_events, rx))
+    }
 }
 
 /// Information about an audio session's process.
@@ -356,7 +442,7 @@ unsafe fn pwstr_to_string(ptr: PWSTR) -> String {
 mod tests {
     use super::*;
 
-    fn init() {
+    pub(crate) fn init() {
         let _ = tracing_subscriber::fmt::try_init();
     }
 
@@ -379,6 +465,51 @@ mod tests {
     }
 
     #[test]
+    fn test_audio_session_events() {
+        init();
+
+        windows::initialize_mta().unwrap();
+
+        let audio_session_manager = AudioSessionManager::new().unwrap().unwrap();
+
+        for session in audio_session_manager.sessions().unwrap_or_default() {
+            if matches!(session.process(), Ok(Some(AudioSessionProcess { name, .. })) if name.as_deref() == Some("Spotify.exe"))
+            {
+                tracing::info!("found spotify, attempting to listen for events");
+                let (_handle, events) = session.events().unwrap();
+
+                loop {
+                    match events.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(event) => tracing::info!("got event: {:?}", event),
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_audio_session_notifications() {
+        init();
+
+        windows::initialize_mta().unwrap();
+
+        let audio_session_manager = AudioSessionManager::new().unwrap().unwrap();
+
+        tracing::info!("attempting to listen for notifications");
+        let (_handle, events) = audio_session_manager.events().unwrap();
+
+        loop {
+            match events.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(event) => {
+                    tracing::info!("got event: {:?}", event);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[test]
     fn test_get_devices() {
         init();
 
@@ -388,6 +519,50 @@ mod tests {
 
         for device in devices {
             println!("{:?}", device.friendly_name);
+        }
+    }
+
+    #[test]
+    fn test_audio_device_events() {
+        init();
+
+        windows::initialize_mta().unwrap();
+
+        let devices = AudioDevice::active_devices().unwrap();
+
+        for mut device in devices {
+            println!("{:?}", device.friendly_name);
+
+            if device.friendly_name.as_deref() == Some("Speakers (Realtek(R) Audio)") {
+                let (_handle, events) = device.events().unwrap();
+
+                loop {
+                    match events.recv_timeout(std::time::Duration::from_secs(10)) {
+                        Ok(event) => tracing::info!("got event: {:?}", event),
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_audio_device_notifications() {
+        init();
+
+        windows::initialize_mta().unwrap();
+
+        tracing::info!("subscribing to notifications");
+        let (_handle, events) = AudioDevice::notifications().unwrap();
+
+        loop {
+            match events.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(event) => tracing::info!("got event: {:?}", event),
+                Err(err) => {
+                    tracing::warn!("recv error: {:?}", err);
+                    break;
+                }
+            }
         }
     }
 }

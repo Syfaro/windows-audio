@@ -9,6 +9,7 @@ license = "MIT"
 windows = "0.13"
 tracing = "0.1"
 lazy_static = "1.4"
+crossbeam-channel = "0.5"
 
 bindings = { path = "./bindings" }
 
