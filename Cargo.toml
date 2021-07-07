@@ -1,0 +1,16 @@
+[package]
+name = "windows-audio"
+version = "0.1.0"
+authors = ["Syfaro <syfaro@huefox.com>"]
+edition = "2018"
+licence = "MIT"
+
+[dependencies]
+windows = "0.13"
+tracing = "0.1"
+lazy_static = "1.4"
+
+bindings = { path = "./bindings" }
+
+[dev-dependencies]
+tracing-subscriber = "0.2"
