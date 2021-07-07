@@ -19,15 +19,36 @@ lazy_static::lazy_static! {
     static ref DEVICE_GUID: Guid = Guid::from("a45c254e-df1c-4efd-8020-67d146a850e0");
 }
 
+/// Common methods to control the volume of a device or session.
+///
+/// Floats must be in the 0.0 to 1.0 range.
+pub trait VolumeControl {
+    /// Get the current volume.
+    fn get_volume(&mut self) -> windows::Result<f32>;
+    /// Set a new volume.
+    fn set_volume(&mut self, level: f32) -> windows::Result<()>;
+
+    /// Get if it is currently muted.
+    fn get_mute(&mut self) -> windows::Result<bool>;
+    /// Set if muted.
+    fn set_mute(&mut self, mute: bool) -> windows::Result<()>;
+}
+
+/// A physical audio device.
 #[derive(Debug)]
 pub struct AudioDevice {
     device: IMMDevice,
     audio_endpoint_volume: Option<IAudioEndpointVolume>,
 
+    /// A friendly name for the device, as defined by the operating system, if
+    /// one exists.
     pub friendly_name: Option<String>,
 }
 
 impl AudioDevice {
+    /// Get all of the active audio devices.
+    ///
+    /// This will exclude unplugged and disabled devices.
     pub fn active_devices() -> windows::Result<Vec<AudioDevice>> {
         unsafe {
             let device_enumerator: IMMDeviceEnumerator =
@@ -87,6 +108,8 @@ impl AudioDevice {
         }
     }
 
+    /// Activate the device volume control interface on demand, and keep a
+    /// reference for future use.
     fn audio_endpoint_volume(&mut self) -> windows::Result<&IAudioEndpointVolume> {
         if let Some(ref audio_endpoint_volume) = self.audio_endpoint_volume {
             tracing::trace!("already had device IAudioEndpointVolume");
@@ -107,14 +130,6 @@ impl AudioDevice {
 
         Ok(self.audio_endpoint_volume.as_ref().unwrap())
     }
-}
-
-pub trait VolumeControl {
-    fn get_volume(&mut self) -> windows::Result<f32>;
-    fn set_volume(&mut self, level: f32) -> windows::Result<()>;
-
-    fn get_mute(&mut self) -> windows::Result<bool>;
-    fn set_mute(&mut self, mute: bool) -> windows::Result<()>;
 }
 
 impl VolumeControl for AudioDevice {
@@ -143,11 +158,15 @@ impl VolumeControl for AudioDevice {
     }
 }
 
+/// A manager for the system's audio sessions.
 pub struct AudioSessionManager {
     manager: IAudioSessionManager2,
 }
 
 impl AudioSessionManager {
+    /// Create a new session manager.
+    ///
+    /// It is possible for this to not be able to get an instance.
     pub fn new() -> windows::Result<Option<Self>> {
         let manager = unsafe {
             tracing::trace!("creating IMMDeviceEnumerator");
@@ -172,6 +191,7 @@ impl AudioSessionManager {
         Ok(manager.map(|manager| Self { manager }))
     }
 
+    /// Get all audio sessions.
     pub fn sessions(&self) -> windows::Result<Vec<AudioSession>> {
         let audio_sessions = unsafe {
             tracing::debug!("getting IAudioSessionEnumerator");
@@ -198,16 +218,21 @@ impl AudioSessionManager {
     }
 }
 
+/// A specific audio session.
 pub struct AudioSession {
     session: IAudioSessionControl2,
     simple_audio_volume: ISimpleAudioVolume,
 }
 
 impl AudioSession {
+    /// Get this audio session's process ID.
     pub fn process_id(&self) -> windows::Result<u32> {
         unsafe { self.session.GetProcessId() }
     }
 
+    /// Get the display name for this session.
+    ///
+    /// This is empty for a lot of application's audio sessions.
     pub fn display_name(&self) -> windows::Result<String> {
         let display_name = unsafe {
             let display_name = self.session.GetDisplayName()?;
@@ -217,59 +242,62 @@ impl AudioSession {
         Ok(display_name)
     }
 
+    /// Try to collect information about the process responsible for the audio
+    /// session.
+    ///
+    /// Some system audio sessions don't have a corresponding process or it is
+    /// possible the user does not have permission to read data.
     pub fn process(&self) -> windows::Result<Option<AudioSessionProcess>> {
         let pid = self.process_id()?;
 
-        tracing::trace!(pid, "attempting to open process");
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) };
+        unsafe {
+            tracing::trace!(pid, "attempting to open process");
+            let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
 
-        if handle.is_invalid() || handle.is_null() {
-            tracing::warn!(pid, "could not open process");
-
-            unsafe {
+            if handle.is_invalid() || handle.is_null() {
+                tracing::warn!(pid, "could not open process");
                 CloseHandle(handle);
+
+                return Ok(None);
             }
 
-            return Ok(None);
-        }
+            let mut buf = [0u8; 512];
+            let lpfilename = PSTR(buf.as_mut_ptr());
+            let nsize = buf.len() as u32;
 
-        let mut buf = [0u8; 512];
-        let lpfilename = PSTR(buf.as_mut_ptr());
-        let nsize = buf.len() as u32;
+            let written = K32GetModuleFileNameExA(handle, HINSTANCE::default(), lpfilename, nsize);
+            let path = if written == 0 {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&buf[0..(written as usize)]).to_string())
+            };
 
-        let written =
-            unsafe { K32GetModuleFileNameExA(handle, HINSTANCE::default(), lpfilename, nsize) };
-        let path = if written == 0 {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&buf[0..(written as usize)]).to_string())
-        };
+            let mut buf = [0u16; 512];
+            let lpbasename = PWSTR(buf.as_mut_ptr());
+            let nsize = buf.len() as u32;
 
-        let mut buf = [0u16; 512];
-        let lpbasename = PWSTR(buf.as_mut_ptr());
-        let nsize = buf.len() as u32;
+            let written = K32GetModuleBaseNameW(handle, HINSTANCE::default(), lpbasename, nsize);
+            let name = if written == 0 {
+                None
+            } else {
+                Some(String::from_utf16_lossy(&buf[0..(written as usize)]))
+            };
 
-        let written =
-            unsafe { K32GetModuleBaseNameW(handle, HINSTANCE::default(), lpbasename, nsize) };
-        let name = if written == 0 {
-            None
-        } else {
-            Some(String::from_utf16_lossy(&buf[0..(written as usize)]).to_string())
-        };
-
-        unsafe {
             CloseHandle(handle);
-        }
 
-        Ok(Some(AudioSessionProcess { pid, path, name }))
+            Ok(Some(AudioSessionProcess { pid, path, name }))
+        }
     }
 }
 
+/// Information about an audio session's process.
 #[derive(Debug)]
 pub struct AudioSessionProcess {
+    /// Process ID.
     pub pid: u32,
+    /// Full path to process executable.
     pub path: Option<String>,
+    /// Name of process executable.
     pub name: Option<String>,
 }
 
@@ -305,6 +333,7 @@ impl VolumeControl for AudioSession {
     }
 }
 
+/// Convert a PWSTR to a String by reading until a null byte is found.
 unsafe fn pwstr_to_string(ptr: PWSTR) -> String {
     let mut len: usize = 0;
     let mut cursor = ptr;

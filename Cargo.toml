@@ -3,7 +3,7 @@ name = "windows-audio"
 version = "0.1.0"
 authors = ["Syfaro <syfaro@huefox.com>"]
 edition = "2018"
-licence = "MIT"
+license = "MIT"
 
 [dependencies]
 windows = "0.13"
